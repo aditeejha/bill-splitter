@@ -1,5 +1,80 @@
 # SDE Intern Assignment: Shared Bill Splitter
 
+## My solution
+
+HomeSplit: the people of a shared home add bills, split them to the cent, and each person pays their own share.
+
+| Part  | Stack                                                                        |
+| ----- | ---------------------------------------------------------------------------- |
+| API   | Hono on Cloudflare Workers, D1                                               |
+| Web   | React 19, TanStack Router, TanStack Query, Tailwind CSS v4, Lucide icons     |
+| Tests | Vitest in the Workers runtime: the 24 visible tests and 40 more that I wrote |
+
+```bash
+pnpm install
+pnpm dev          # api on :8787, web on http://localhost:5173
+pnpm check && pnpm typecheck && pnpm test
+```
+
+### How a request flows
+
+API: `route (api/src/routes) → validation (api/src/validation.ts) → data layer (api/src/db.ts) → D1`. Handlers throw an `HTTPException`, and one `onError` handler turns it into `{ "error": "message" }`. A route that does not exist also answers with JSON.
+
+Web: `web/src/lib/api.ts` is the only place that calls `fetch`. It turns every failure into an `ApiError` with a message a person can read: a timeout after 10 seconds, a network error, or a 500 that is not even JSON. TanStack Query keeps the loading and error state of each list, and the page shows a skeleton, an empty state or an error with a **Try again** button for each one.
+
+### Extra endpoints for the page
+
+The page has to read data that the brief does not list, so I added three read-only endpoints:
+
+- `GET /api/homes` → `{ homes: [{ id, name, memberCount }] }`
+- `GET /api/homes/:homeId` → `{ id, name, members }`, members in the order they joined
+- `GET /api/homes/:homeId/bills` → `{ bills }`, newest first, each bill with `createdAt` and its shares
+
+### Database constraints
+
+All in `api/migrations/0001_init.sql`.
+
+| Constraint                                                                | What it stops                                                                         |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `members_home_fk`, `bills_home_fk`, `shares_bill_fk`, `shares_member_fk`  | Rows that point at a home, bill or member that does not exist                         |
+| `members_position_unique`                                                 | Two members in the same place in the join order, which would make the split ambiguous |
+| `bills_total_positive_integer`                                            | A total that is 0, negative or a decimal, even if something skips the API check       |
+| `shares_amount_not_negative`                                              | A negative or decimal share                                                           |
+| `shares_one_per_member`                                                   | One member getting two shares of the same bill                                        |
+| `shares_paid_with_key`                                                    | A share marked as paid without the key that paid it, or a key on an unpaid share      |
+| `homes_name_not_blank`, `members_name_not_blank`, `bills_title_not_blank` | Empty names and titles                                                                |
+
+`api/test/constraints.test.ts` writes straight to D1, past the API, to show that the schema itself refuses this data.
+
+### The cases from the brief
+
+| Case                               | How it is handled                                                                                                                     |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. A home with no members          | `POST /bills` answers 422. The form is disabled and says to add people first.                                                         |
+| 2. Amount 0, negative or not whole | `requirePositiveCents` answers 422 and the `CHECK` constraint is the second guard. The form reads dollars as text, so no float maths. |
+| 3. Amount does not divide evenly   | `splitEvenly` gives the leftover cents one by one in join order. The form previews the split before saving.                           |
+| 4. The same payment sent twice     | The key is stored on the share. The same key gets 200 with the stored result, and nothing is paid twice.                              |
+| 5. Two people pay the same share   | One conditional `UPDATE … WHERE paid_at IS NULL`. Only one request can change the row; the other gets 409.                            |
+| 6. Bill or share does not exist    | 404 with `Bill not found` or `Share not found`.                                                                                       |
+| 7. API answers 500 or is slow      | 10 s timeout, readable errors, retry buttons, a "server is slow" note after 2.5 s, and a router error screen as the last guard.       |
+
+## Decisions
+
+1. **Paying is one conditional UPDATE, and the idempotency key is stored on the share.**
+   `UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL`. D1 runs writes one after the other, so when two requests race only the first one changes the row. If nothing changed, I read the share: the same key gets the stored result (200), another key gets 409. Keeping the key on the row means the payment and its key are saved in the same write and can never disagree, and I don't need a second table. The trade-off is that a key belongs to one share: if a client reuses a key for a different share, that request simply pays the other share instead of being rejected.
+
+2. **The join order is an explicit `position` column, not a timestamp.**
+   The split hands out extra cents by join order, so the order has to be exact. Two members can be added in the same millisecond, so `created_at` can tie. The position is computed in the same `INSERT … SELECT` that checks the home exists, and `UNIQUE (home_id, position)` makes a duplicate impossible. A test adds 8 members at the same time and checks all of them are kept.
+
+3. **The page never shows a payment as done before the server confirms it.**
+   There is no optimistic update: the button shows "Paying" and the share stays unpaid until a 200 comes back. If the request fails without a clear answer (timeout, network error, 5xx), the payment may still have gone through, so the retry sends the **same** `Idempotency-Key`. The server then returns the first result instead of paying twice or answering 409. A 4xx answer is final, so the next click starts with a new key.
+
+Smaller choices: plain TypeScript type guards for validation, because the request bodies are tiny and need no library; the bill and its shares are saved in one D1 batch, which runs as a transaction, so a bill is never saved without its shares.
+
+---
+
+## Assignment brief
+
 Welcome. In this assignment you build a small bill splitter for a shared home. It has two parts:
 
 1. **Homes and members:** create a home and add members to it.
